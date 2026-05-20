@@ -1,10 +1,10 @@
 import streamlit as st
 import PyPDF2
 import numpy as np
-import faiss   # 🔥 NEW (FAISS)
+import faiss
 from sentence_transformers import SentenceTransformer
 
-st.set_page_config(page_title="FAISS Resume Ranker", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Hybrid ATS Resume Ranker", page_icon="📄", layout="wide")
 
 # =========================
 # LOAD MODEL
@@ -16,7 +16,7 @@ def load_model():
 model = load_model()
 
 # =========================
-# EXTRACT TEXT
+# EXTRACT TEXT FROM PDF
 # =========================
 def extract_text(file):
     reader = PyPDF2.PdfReader(file)
@@ -34,16 +34,37 @@ def chunk_text(text, chunk_size=300):
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
 # =========================
+# KEYWORD EXTRACTION
+# =========================
+def extract_keywords(text):
+    words = text.lower().split()
+    return set(words)
+
+# =========================
+# KEYWORD MATCH SCORE
+# =========================
+def keyword_match_score(jd_text, resume_text):
+    jd_keywords = extract_keywords(jd_text)
+    resume_keywords = extract_keywords(resume_text)
+
+    if len(jd_keywords) == 0:
+        return 0
+
+    matched = jd_keywords.intersection(resume_keywords)
+    return len(matched) / len(jd_keywords)
+
+# =========================
 # UI
 # =========================
-st.title("📄 AI Resume Ranker (FAISS Powered)")
+st.title("📄 Hybrid AI Resume Ranker (Semantic + Keyword)")
+
 job_description = st.text_area("Enter Job Description")
 uploaded_files = st.file_uploader("Upload Resumes", type=["pdf"], accept_multiple_files=True)
 
 # =========================
 # MAIN LOGIC
 # =========================
-if st.button("Analyze with FAISS"):
+if st.button("Analyze Resumes"):
 
     if not uploaded_files or not job_description:
         st.warning("Upload resumes and enter job description")
@@ -52,17 +73,18 @@ if st.button("Analyze with FAISS"):
     with st.spinner("Processing..."):
 
         # =========================
-        # STEP 1: Convert JD to vector
+        # STEP 1: JD EMBEDDING
         # =========================
         jd_embedding = model.encode([job_description])[0]
         jd_embedding = np.array([jd_embedding]).astype('float32')
-        faiss.normalize_L2(jd_embedding)  # Normalize for Cosine Similarity
+        faiss.normalize_L2(jd_embedding)
 
         # =========================
-        # STEP 2: Process resumes
+        # STEP 2: PROCESS RESUMES
         # =========================
         resume_embeddings = []
         resume_names = []
+        resume_texts = []
 
         for file in uploaded_files:
 
@@ -71,45 +93,66 @@ if st.button("Analyze with FAISS"):
             if not text.strip():
                 continue
 
+            resume_texts.append(text)
+            resume_names.append(file.name)
+
             chunks = chunk_text(text)
 
-            # Convert chunks → embeddings
             chunk_embeds = model.encode(chunks)
 
-            # Average all chunks → single vector
+            # Average chunk embeddings
             resume_vector = np.mean(chunk_embeds, axis=0)
 
             resume_embeddings.append(resume_vector)
-            resume_names.append(file.name)
 
         # Convert to numpy
         resume_embeddings = np.array(resume_embeddings).astype('float32')
-        faiss.normalize_L2(resume_embeddings)  # Normalize for Cosine Similarity
+        faiss.normalize_L2(resume_embeddings)
 
         # =========================
-        # STEP 3: CREATE FAISS INDEX
+        # STEP 3: FAISS INDEX
         # =========================
         dimension = resume_embeddings.shape[1]
-
-        index = faiss.IndexFlatIP(dimension)  # Inner Product = Cosine Similarity
-
-        # Add all resume vectors into FAISS
+        index = faiss.IndexFlatIP(dimension)
         index.add(resume_embeddings)
 
         # =========================
-        # STEP 4: SEARCH (MAGIC)
+        # STEP 4: SEARCH
         # =========================
         k = min(10, len(resume_embeddings))
-
         distances, indices = index.search(jd_embedding, k)
 
         # =========================
-        # STEP 5: SHOW RESULTS
+        # STEP 5: HYBRID SCORING
         # =========================
-        st.success("✅ Done! Top Matches:")
+        results = []
 
-        for rank, idx in enumerate(indices[0]):
+        for i, idx in enumerate(indices[0]):
+
             name = resume_names[idx]
-            score = distances[0][rank]
+            semantic_score = distances[0][i]
+            resume_text = resume_texts[idx]
 
-            st.write(f"{rank+1}. {name} → Score: {score:.4f}")
+            # Keyword score
+            keyword_score = keyword_match_score(job_description, resume_text)
+
+            # Final hybrid score
+            final_score = (0.6 * semantic_score) + (0.4 * keyword_score)
+
+            results.append((name, final_score, semantic_score, keyword_score))
+
+        # Sort by final score
+        results.sort(key=lambda x: x[1], reverse=True)
+
+        # =========================
+        # DISPLAY RESULTS
+        # =========================
+        st.success("✅ Top Matching Resumes:")
+
+        for rank, (name, final, sem, key) in enumerate(results):
+            st.write(f"""
+            🔹 **Rank {rank+1}: {name}**
+            - Final Score: {final:.4f}
+            - Semantic Score: {sem:.4f}
+            - Keyword Score: {key:.4f}
+            """)
