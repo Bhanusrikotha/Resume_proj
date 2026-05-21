@@ -2,12 +2,16 @@ import streamlit as st
 import PyPDF2
 import numpy as np
 import faiss
+import re
 from sentence_transformers import SentenceTransformer
 
-st.set_page_config(page_title="Hybrid ATS Resume Ranker", page_icon="📄", layout="wide")
+# =========================
+# PAGE CONFIG
+# =========================
+st.set_page_config(page_title="🚀 AI Resume Ranker", layout="wide")
 
 # =========================
-# LOAD MODEL
+# LOAD MODEL (CACHED)
 # =========================
 @st.cache_resource
 def load_model():
@@ -16,75 +20,110 @@ def load_model():
 model = load_model()
 
 # =========================
-# EXTRACT TEXT FROM PDF
+# SKILLS DATABASE
 # =========================
-def extract_text(file):
-    reader = PyPDF2.PdfReader(file)
-    text = ""
-    for page in reader.pages:
-        if page.extract_text():
-            text += page.extract_text()
-    return text
+SKILLS_DB = [
+    "python", "java", "c++", "sql", "aws", "azure", "gcp",
+    "docker", "kubernetes", "react", "node", "express",
+    "tensorflow", "pytorch", "machine learning", "deep learning",
+    "nlp", "data analysis", "devops", "linux", "git"
+]
 
 # =========================
-# CHUNK TEXT
+# PDF TEXT EXTRACTION
+# =========================
+def extract_text(file):
+    try:
+        reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            if page.extract_text():
+                text += page.extract_text()
+        return text.lower()
+    except:
+        return ""
+
+# =========================
+# TEXT CHUNKING
 # =========================
 def chunk_text(text, chunk_size=300):
     words = text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
 # =========================
-# KEYWORD EXTRACTION
+# SKILL EXTRACTION
 # =========================
-def extract_keywords(text):
-    words = text.lower().split()
-    return set(words)
+def extract_skills(text):
+    found = []
+    for skill in SKILLS_DB:
+        if skill in text:
+            found.append(skill)
+    return list(set(found))
 
 # =========================
-# KEYWORD MATCH SCORE
+# EXPERIENCE EXTRACTION
 # =========================
-def keyword_match_score(jd_text, resume_text):
-    jd_keywords = extract_keywords(jd_text)
-    resume_keywords = extract_keywords(resume_text)
+def extract_experience(text):
+    matches = re.findall(r'(\d+)\+?\s*(years|yrs)', text)
+    if matches:
+        return max([int(m[0]) for m in matches])
+    return 0
 
-    if len(jd_keywords) == 0:
+# =========================
+# SKILL MATCH SCORE
+# =========================
+def skill_match_score(jd_skills, resume_skills):
+    if not jd_skills:
         return 0
+    matched = set(jd_skills).intersection(set(resume_skills))
+    return len(matched) / len(jd_skills)
 
-    matched = jd_keywords.intersection(resume_keywords)
-    return len(matched) / len(jd_keywords)
+# =========================
+# EXPERIENCE SCORE
+# =========================
+def experience_score(candidate_exp, required_exp):
+    if required_exp == 0:
+        return 1
+    return min(candidate_exp / required_exp, 1)
 
 # =========================
 # UI
 # =========================
-st.title("📄 Hybrid AI Resume Ranker (Semantic + Keyword)")
+st.title("🚀 Industry-Level AI Resume Ranker")
 
-job_description = st.text_area("Enter Job Description")
-uploaded_files = st.file_uploader("Upload Resumes", type=["pdf"], accept_multiple_files=True)
+job_description = st.text_area("📌 Enter Job Description")
+
+required_exp = st.slider("📊 Required Experience (Years)", 0, 15, 2)
+
+uploaded_files = st.file_uploader(
+    "📄 Upload Resumes (PDF)", type=["pdf"], accept_multiple_files=True
+)
 
 # =========================
-# MAIN LOGIC
+# MAIN PROCESS
 # =========================
-if st.button("Analyze Resumes"):
+if st.button("🔍 Analyze Resumes"):
 
     if not uploaded_files or not job_description:
-        st.warning("Upload resumes and enter job description")
+        st.warning("⚠️ Please upload resumes and enter job description")
         st.stop()
 
-    with st.spinner("Processing..."):
+    with st.spinner("⏳ Processing resumes..."):
 
         # =========================
-        # STEP 1: JD EMBEDDING
+        # JD PROCESSING
         # =========================
         jd_embedding = model.encode([job_description])[0]
         jd_embedding = np.array([jd_embedding]).astype('float32')
         faiss.normalize_L2(jd_embedding)
 
+        jd_skills = extract_skills(job_description.lower())
+
         # =========================
-        # STEP 2: PROCESS RESUMES
+        # RESUME PROCESSING
         # =========================
         resume_embeddings = []
-        resume_names = []
-        resume_texts = []
+        resume_data = []
 
         for file in uploaded_files:
 
@@ -93,66 +132,94 @@ if st.button("Analyze Resumes"):
             if not text.strip():
                 continue
 
-            resume_texts.append(text)
-            resume_names.append(file.name)
+            # Structured data extraction
+            skills = extract_skills(text)
+            exp = extract_experience(text)
 
+            # Semantic embedding
             chunks = chunk_text(text)
-
             chunk_embeds = model.encode(chunks)
-
-            # Average chunk embeddings
             resume_vector = np.mean(chunk_embeds, axis=0)
 
             resume_embeddings.append(resume_vector)
+
+            resume_data.append({
+                "name": file.name,
+                "skills": skills,
+                "experience": exp
+            })
+
+        # Handle no valid resumes
+        if len(resume_embeddings) == 0:
+            st.error("❌ No valid resume text found")
+            st.stop()
 
         # Convert to numpy
         resume_embeddings = np.array(resume_embeddings).astype('float32')
         faiss.normalize_L2(resume_embeddings)
 
         # =========================
-        # STEP 3: FAISS INDEX
+        # FAISS INDEX
         # =========================
         dimension = resume_embeddings.shape[1]
         index = faiss.IndexFlatIP(dimension)
         index.add(resume_embeddings)
 
         # =========================
-        # STEP 4: SEARCH
+        # SEARCH
         # =========================
         k = min(10, len(resume_embeddings))
         distances, indices = index.search(jd_embedding, k)
 
         # =========================
-        # STEP 5: HYBRID SCORING
+        # SCORING
         # =========================
         results = []
 
         for i, idx in enumerate(indices[0]):
 
-            name = resume_names[idx]
-            semantic_score = distances[0][i]
-            resume_text = resume_texts[idx]
+            data = resume_data[idx]
 
-            # Keyword score
-            keyword_score = keyword_match_score(job_description, resume_text)
+            semantic = float(distances[0][i])
+            skill_score = skill_match_score(jd_skills, data["skills"])
+            exp_score = experience_score(data["experience"], required_exp)
 
-            # Final hybrid score
-            final_score = (0.6 * semantic_score) + (0.4 * keyword_score)
+            # FINAL SCORE
+            final_score = (
+                0.4 * semantic +
+                0.3 * skill_score +
+                0.2 * exp_score +
+                0.1 * (1 if data["experience"] > 0 else 0)
+            )
 
-            results.append((name, final_score, semantic_score, keyword_score))
+            results.append({
+                "name": data["name"],
+                "final": final_score,
+                "semantic": semantic,
+                "skill": skill_score,
+                "exp_score": exp_score,
+                "experience": data["experience"],
+                "skills": data["skills"]
+            })
 
-        # Sort by final score
-        results.sort(key=lambda x: x[1], reverse=True)
+        # Sort results
+        results = sorted(results, key=lambda x: x["final"], reverse=True)
 
         # =========================
         # DISPLAY RESULTS
         # =========================
-        st.success("✅ Top Matching Resumes:")
+        st.success("🎯 Top Matching Candidates")
 
-        for rank, (name, final, sem, key) in enumerate(results):
-            st.write(f"""
-            🔹 **Rank {rank+1}: {name}**
-            - Final Score: {final:.4f}
-            - Semantic Score: {sem:.4f}
-            - Keyword Score: {key:.4f}
-            """)
+        for rank, res in enumerate(results):
+
+            st.markdown(f"""
+### 🏆 Rank {rank+1}: {res['name']}
+
+**Final Score:** {res['final']:.4f}  
+- 🧠 Semantic Score: {res['semantic']:.4f}  
+- 🧩 Skill Match: {res['skill']:.4f}  
+- 📈 Experience Score: {res['exp_score']:.4f}  
+- ⏳ Extracted Experience: {res['experience']} years  
+
+**💡 Skills Found:** {", ".join(res['skills']) if res['skills'] else "None"}
+""")
